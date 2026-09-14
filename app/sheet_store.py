@@ -210,71 +210,36 @@ def replace_case(case_id: int, case_row: dict, courses: list[dict]) -> tuple[dic
     return data["caseRow"], data["courses"]
 
 
-def upload_course_document(
-    case_id: int,
-    course_id: int,
+def insert_document_record(
     doc_type: str,
     file_name: str,
     mime_type: str,
-    data_base64: str,
-    folder_id: str,
-    case_name: str,
+    s3_key: str,
     uploaded_at: str,
-) -> tuple[dict, str]:
-    """Duplicate-checks, ensures the Drive folder exists, uploads the file,
-    inserts the Documents row, and (if a folder was just created) updates the
-    case's drive_folder_id -- all in one Apps Script round-trip (server-side
-    action `uploadCourseDocument`) instead of up to ~5 separate calls.
-    Raises StoreError("DUPLICATE_DOCUMENT") if that doc_type is already saved.
+    course_id: int | None = None,
+    case_id: int | None = None,
+) -> dict:
+    """Records a Documents row for a file that's already been uploaded to S3
+    (the new fast, synchronous primary store) -- no Drive/base64 involved at
+    all here. Server-side action `insertDocumentRecord` still does an atomic
+    duplicate check + insert under one lock (same guarantee
+    upload_course_document/upload_case_document used to give), it just skips
+    the slow Drive upload in between the two checks. Drive sync happens
+    later, out-of-band, via drive_sync_worker.py. Raises
+    StoreError("DUPLICATE_DOCUMENT") if that doc_type is already saved for
+    this course/case.
     """
     data = _call(
         {
-            "action": "uploadCourseDocument",
-            "caseId": str(case_id),
-            "courseId": str(course_id),
+            "action": "insertDocumentRecord",
+            "caseId": str(case_id) if case_id is not None else "",
+            "courseId": str(course_id) if course_id is not None else "",
             "docType": doc_type,
             "fileName": file_name,
             "mimeType": mime_type,
-            "dataBase64": data_base64,
-            "folderId": folder_id or "",
-            "caseName": case_name,
+            "s3Key": s3_key,
             "uploadedAt": uploaded_at,
         }
     )
     _invalidate("Documents")
-    if not folder_id:
-        _invalidate("Cases")
-    return data["document"], data["folderId"]
-
-
-def upload_case_document(
-    case_id: int,
-    doc_type: str,
-    file_name: str,
-    mime_type: str,
-    data_base64: str,
-    folder_id: str,
-    case_name: str,
-    uploaded_at: str,
-) -> tuple[dict, str]:
-    """Same as upload_course_document, but for the case-level documents
-    (current visa, AFP, PTE, OVHC) that live on the case itself rather than
-    on any one qualification (server-side action `uploadCaseDocument`).
-    """
-    data = _call(
-        {
-            "action": "uploadCaseDocument",
-            "caseId": str(case_id),
-            "docType": doc_type,
-            "fileName": file_name,
-            "mimeType": mime_type,
-            "dataBase64": data_base64,
-            "folderId": folder_id or "",
-            "caseName": case_name,
-            "uploadedAt": uploaded_at,
-        }
-    )
-    _invalidate("Documents")
-    if not folder_id:
-        _invalidate("Cases")
-    return data["document"], data["folderId"]
+    return data["document"]

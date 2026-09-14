@@ -1,14 +1,14 @@
 
 
-var PARENT_FOLDER_ID = 'REPLACE_WITH_YOUR_DRIVE_FOLDER_ID';
-var SPREADSHEET_ID = 'REPLACE_WITH_YOUR_GOOGLE_SHEET_ID';
-var SHARED_SECRET = 'REPLACE_WITH_A_RANDOM_SECRET';
+var PARENT_FOLDER_ID = '';
+var SHARED_SECRET = '';
+var SPREADSHEET_ID = '';
 
 var TABLE_COLUMNS = {
   Users: ['id', 'email', 'hashed_password', 'full_name', 'role', 'created_at'],
   Cases: ['id', 'owner_user_id', 'student_name', 'stream', 'status', 'drive_folder_id', 'created_at', 'eligibility_status', 'eligibility_reason', 'total_duration_weeks', 'visa_subclass', 'visa_length_of_stay_date', 'pte_valid_until_date', 'ovhc_relevant_date', 'afp_issue_date', 'document_validity_status', 'document_validity_reason', 'new_coe_start_date', 'lodgement_date_status', 'lodgement_date_reason', 'lodgement_date', 'lodgement_basis', 'duration_breakdown_json', 'document_validity_breakdown_json', 'lodgement_breakdown_json'],
   Courses: ['id', 'case_id', 'name', 'course_type', 'start_date', 'end_date', 'cricos_weeks', 'sort_order', 'cricos_code'],
-  Documents: ['id', 'course_id', 'doc_type', 'file_name', 'drive_file_id', 'drive_view_link', 'uploaded_at', 'case_id']
+  Documents: ['id', 'course_id', 'doc_type', 'file_name', 'drive_file_id', 'drive_view_link', 'uploaded_at', 'case_id', 's3_key', 'mime_type', 'drive_sync_status', 'synced_at', 'retry_count', 'last_error']
 };
 
 function doPost(e) {
@@ -29,8 +29,7 @@ function doPost(e) {
     else if (body.action === 'replaceCaseQualifications') result = replaceCaseQualifications(body.caseId, body.caseRow, body.courses);
     else if (body.action === 'createUser') result = createUser(body.row);
     else if (body.action === 'createCaseWithCourses') result = createCaseWithCourses(body.caseRow, body.courses);
-    else if (body.action === 'uploadCourseDocument') result = uploadCourseDocument(body);
-    else if (body.action === 'uploadCaseDocument') result = uploadCaseDocument(body);
+    else if (body.action === 'insertDocumentRecord') result = { document: insertDocumentRecord(body) };
     else return jsonResponse({ ok: false, error: 'Unknown action: ' + body.action });
 
     return jsonResponse(Object.assign({ ok: true }, result));
@@ -227,87 +226,45 @@ function createCaseWithCourses(caseRow, courses) {
   });
 }
 
-function uploadCourseDocument(body) {
-  var courseId = body.courseId;
-  var docType = body.docType;
+// S3-primary pipeline: the file already went straight to S3 from the
+// backend (fast, synchronous) -- this just records the Documents row with
+// no Drive involvement at all. drive_sync_worker.py fills in drive_file_id/
+// drive_view_link later, once it's actually synced. Same locked
+// check-then-insert duplicate guard as uploadCourseDocument/
+// uploadCaseDocument, just without the slow Drive upload in between the two
+// checks.
+function insertDocumentRecord(body) {
+  var isCourseDoc = !!body.courseId;
+  var key = isCourseDoc ? 'course_id' : 'case_id';
+  var keyValue = isCourseDoc ? body.courseId : body.caseId;
 
   function checkDuplicate() {
-    var existing = getRows('Documents').filter(function (d) { return String(d.course_id) === String(courseId) && d.doc_type === docType; });
-    if (existing.length) throw new Error('DUPLICATE_DOCUMENT');
-  }
-
-  // Fail fast before doing the slow Drive upload if it's obviously a repeat.
-  withLock(checkDuplicate);
-
-  var folderId = body.folderId;
-  var folderCreated = false;
-  if (!folderId) {
-    folderId = ensureFolder(body.caseName).folderId;
-    folderCreated = true;
-  }
-  var uploaded = uploadFile(folderId, body.fileName, body.mimeType, body.dataBase64);
-
-  // Re-check + insert atomically (guards a race between two identical
-  // uploads that both passed the fast pre-check above), and record the
-  // folder id on the case if we just created it -- all under one lock.
-  var document = withLock(function () {
-    checkDuplicate();
-    var doc = appendRecord('Documents', {
-      course_id: String(courseId),
-      doc_type: docType,
-      file_name: body.fileName,
-      drive_file_id: uploaded.fileId,
-      drive_view_link: uploaded.webViewLink,
-      uploaded_at: body.uploadedAt
+    var existing = getRows('Documents').filter(function (d) {
+      return String(d[key]) === String(keyValue) && d.doc_type === body.docType;
     });
-    if (folderCreated && body.caseId) {
-      updateRecord('Cases', body.caseId, { drive_folder_id: folderId });
-    }
-    return doc;
-  });
-
-  return { document: document, folderId: folderId };
-}
-
-// Same shape as uploadCourseDocument, but for the case-level documents
-// (current visa, AFP, PTE, OVHC) that aren't tied to any one qualification --
-// keyed by case_id instead of course_id, with course_id left blank.
-function uploadCaseDocument(body) {
-  var caseId = body.caseId;
-  var docType = body.docType;
-
-  function checkDuplicate() {
-    var existing = getRows('Documents').filter(function (d) { return String(d.case_id) === String(caseId) && d.doc_type === docType; });
     if (existing.length) throw new Error('DUPLICATE_DOCUMENT');
   }
 
   withLock(checkDuplicate);
 
-  var folderId = body.folderId;
-  var folderCreated = false;
-  if (!folderId) {
-    folderId = ensureFolder(body.caseName).folderId;
-    folderCreated = true;
-  }
-  var uploaded = uploadFile(folderId, body.fileName, body.mimeType, body.dataBase64);
-
-  var document = withLock(function () {
+  return withLock(function () {
     checkDuplicate();
-    var doc = appendRecord('Documents', {
-      case_id: String(caseId),
-      doc_type: docType,
+    return appendRecord('Documents', {
+      course_id: isCourseDoc ? String(body.courseId) : '',
+      case_id: isCourseDoc ? '' : String(body.caseId),
+      doc_type: body.docType,
       file_name: body.fileName,
-      drive_file_id: uploaded.fileId,
-      drive_view_link: uploaded.webViewLink,
+      s3_key: body.s3Key,
+      mime_type: body.mimeType,
+      drive_file_id: '',
+      drive_view_link: '',
+      drive_sync_status: 'pending',
+      synced_at: '',
+      retry_count: 0,
+      last_error: '',
       uploaded_at: body.uploadedAt
     });
-    if (folderCreated) {
-      updateRecord('Cases', caseId, { drive_folder_id: folderId });
-    }
-    return doc;
   });
-
-  return { document: document, folderId: folderId };
 }
 
 function replaceCaseQualifications(caseId, caseRow, courses) {

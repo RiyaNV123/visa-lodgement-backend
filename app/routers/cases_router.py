@@ -1,4 +1,3 @@
-import base64
 import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date as date_cls
@@ -23,11 +22,12 @@ from app.document_extract import (
     extract_pte_fields,
     extract_pte_fields_from_text,
 )
-from app.drive_service import DriveServiceError, download_file, ocr_file
+from app.drive_service import DriveServiceError, ocr_file
 from app.eligibility import MIN_TOTAL_WEEKS, CourseInput, Stage1Input, Stage3Input, calculate_duration, check_stage1, check_stage3
 from app.models import CASE_DOC_TYPES, DocType, User, UserRole
+from app.s3_service import S3ServiceError, download_bytes, upload_bytes
 from app.schemas import CaseCreate, CaseDetailResponse, CaseSummaryResponse, CourseCreate, CourseResponse, DocumentResponse
-from app.sheet_store import StoreError, as_int, as_optional_int, case_by_id, case_rows, courses_for_case, create_case, delete, documents_for_case, documents_for_course, find_user_by_id, insert, now, replace_case, update, upload_case_document, upload_course_document
+from app.sheet_store import StoreError, as_int, as_optional_int, case_by_id, case_rows, courses_for_case, create_case, delete, documents_for_case, documents_for_course, find_user_by_id, insert, insert_document_record, now, replace_case, update
 
 router = APIRouter(prefix="/cases", tags=["cases"])
 ALLOWED_DOC_CONTENT_TYPES = {"application/pdf", "image/jpeg", "image/png"}
@@ -237,9 +237,9 @@ def reextract_missing_course_fields(course: dict) -> dict:
         if not doc:
             return {}
         try:
-            content = download_file(doc["drive_file_id"])
+            content = download_bytes(doc["s3_key"])
             fields = _completion_letter_fields(content, doc["drive_file_id"])
-        except DriveServiceError:
+        except S3ServiceError:
             fields = {}
         return {key: fields[key] for key in ("start_date", "end_date") if fields.get(key) and not course.get(key)}
 
@@ -250,9 +250,9 @@ def reextract_missing_course_fields(course: dict) -> dict:
         if not doc:
             return {}
         try:
-            content = download_file(doc["drive_file_id"])
+            content = download_bytes(doc["s3_key"])
             fields = _coe_fields(content, doc["drive_file_id"])
-        except DriveServiceError:
+        except S3ServiceError:
             fields = {}
         cricos_code = fields.get("cricos_code")
         if not cricos_code:
@@ -375,9 +375,9 @@ def reextract_missing_case_fields(case: dict) -> dict:
         if not doc:
             return {}
         try:
-            content = download_file(doc["drive_file_id"])
+            content = download_bytes(doc["s3_key"])
             fields = _case_doc_fields(DocType.current_visa.value, content, doc["drive_file_id"])
-        except DriveServiceError:
+        except S3ServiceError:
             fields = {}
         result = {}
         if fields.get("visa_subclass") and not case.get("visa_subclass"):
@@ -393,9 +393,9 @@ def reextract_missing_case_fields(case: dict) -> dict:
         if not doc:
             return {}
         try:
-            content = download_file(doc["drive_file_id"])
+            content = download_bytes(doc["s3_key"])
             fields = _case_doc_fields(DocType.pte.value, content, doc["drive_file_id"])
-        except DriveServiceError:
+        except S3ServiceError:
             fields = {}
         return {"pte_valid_until_date": fields["valid_until_date"]} if fields.get("valid_until_date") else {}
 
@@ -406,9 +406,9 @@ def reextract_missing_case_fields(case: dict) -> dict:
         if not doc:
             return {}
         try:
-            content = download_file(doc["drive_file_id"])
+            content = download_bytes(doc["s3_key"])
             fields = _case_doc_fields(DocType.ovhc.value, content, doc["drive_file_id"])
-        except DriveServiceError:
+        except S3ServiceError:
             fields = {}
         return {"ovhc_relevant_date": fields["relevant_date"]} if fields.get("relevant_date") else {}
 
@@ -419,9 +419,9 @@ def reextract_missing_case_fields(case: dict) -> dict:
         if not doc:
             return {}
         try:
-            content = download_file(doc["drive_file_id"])
+            content = download_bytes(doc["s3_key"])
             fields = _case_doc_fields(doc["doc_type"], content, doc["drive_file_id"])
-        except DriveServiceError:
+        except S3ServiceError:
             fields = {}
         return {"afp_issue_date": fields["issue_date"]} if fields.get("issue_date") else {}
 
@@ -432,9 +432,9 @@ def reextract_missing_case_fields(case: dict) -> dict:
         if not doc:
             return {}
         try:
-            content = download_file(doc["drive_file_id"])
+            content = download_bytes(doc["s3_key"])
             fields = _case_doc_fields(DocType.new_coe.value, content, doc["drive_file_id"])
-        except DriveServiceError:
+        except S3ServiceError:
             fields = {}
         return {"new_coe_start_date": fields["start_date"]} if fields.get("start_date") else {}
 
@@ -769,24 +769,24 @@ async def upload_document(case_id: int, course_id: int, doc_type: DocType = Form
     if len(content) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="File exceeds 15MB limit")
     file_name = f"{course['name']} - {DOCUMENT_FILE_LABELS[doc_type]}{CONTENT_TYPE_EXTENSIONS[file.content_type]}"
+    s3_key = f"485_docs/{case['student_name']}-{case_id}/{file_name}"
     try:
-        # Duplicate-check, folder creation, Drive upload, Documents insert,
-        # and the Cases.drive_folder_id update all happen in one Apps Script
-        # round-trip instead of up to ~5 separate calls.
-        document, _ = upload_course_document(
-            case_id=case_id,
-            course_id=course_id,
+        # S3 is the fast, synchronous primary store -- Drive sync happens
+        # later, out-of-band, via drive_sync_worker.py (see
+        # s3-drive-sync-plan.md). insert_document_record still
+        # duplicate-checks under one lock, it just never touches Drive.
+        upload_bytes(s3_key, content, file.content_type)
+        document = insert_document_record(
             doc_type=doc_type.value,
             file_name=file_name,
             mime_type=file.content_type,
-            data_base64=base64.b64encode(content).decode("ascii"),
-            folder_id=case["drive_folder_id"],
-            case_name=f"{case['student_name']}-{case_id}",
+            s3_key=s3_key,
             uploaded_at=now(),
+            course_id=course_id,
         )
-        extract_and_store_course_fields(course, doc_type.value, content, document["drive_file_id"])
+        extract_and_store_course_fields(course, doc_type.value, content, drive_file_id="")
         return document_response(document)
-    except (StoreError, DriveServiceError) as exc:
+    except (StoreError, S3ServiceError) as exc:
         # Same "Error: CODE" vs. bare-code mismatch as DUPLICATE_CASE/
         # DUPLICATE_EMAIL elsewhere -- an exact match here never fires.
         if "DUPLICATE_DOCUMENT" in str(exc):
@@ -805,20 +805,20 @@ async def upload_case_level_document(case_id: int, doc_type: DocType = Form(...)
     if len(content) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="File exceeds 15MB limit")
     file_name = f"{DOCUMENT_FILE_LABELS[doc_type]}{CONTENT_TYPE_EXTENSIONS[file.content_type]}"
+    s3_key = f"485_docs/{case['student_name']}-{case_id}/{file_name}"
     try:
-        document, _ = upload_case_document(
-            case_id=case_id,
+        upload_bytes(s3_key, content, file.content_type)
+        document = insert_document_record(
             doc_type=doc_type.value,
             file_name=file_name,
             mime_type=file.content_type,
-            data_base64=base64.b64encode(content).decode("ascii"),
-            folder_id=case["drive_folder_id"],
-            case_name=f"{case['student_name']}-{case_id}",
+            s3_key=s3_key,
             uploaded_at=now(),
+            case_id=case_id,
         )
-        extract_and_store_case_fields(case_id, doc_type.value, content, document["drive_file_id"])
+        extract_and_store_case_fields(case_id, doc_type.value, content, drive_file_id="")
         return document_response(document)
-    except (StoreError, DriveServiceError) as exc:
+    except (StoreError, S3ServiceError) as exc:
         # Same "Error: CODE" vs. bare-code mismatch as DUPLICATE_CASE/
         # DUPLICATE_EMAIL elsewhere -- an exact match here never fires.
         if "DUPLICATE_DOCUMENT" in str(exc):

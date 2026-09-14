@@ -23,6 +23,10 @@ async def sheet_cache_per_request(request: Request, call_next):
     reset_request_cache()
     return await call_next(request)
 
+@app.get('/')
+def root(): 
+    return {"message": "Server is running"}
+
 app.include_router(auth_router.router)
 app.include_router(cases_router.router)
 app.include_router(admin_router.router)

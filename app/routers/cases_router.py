@@ -6,6 +6,14 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, s
 
 from app.auth import get_current_user
 from app.cricos_lookup import CricosLookupError, lookup_duration_weeks
+
+from app.drive_service import DriveServiceError, ocr_file
+from app.eligibility import MIN_TOTAL_WEEKS, CourseInput, Stage1Input, Stage3Input, calculate_duration, check_stage1, check_stage3
+from app.models import CASE_DOC_TYPES, DocType, User, UserRole
+from app.s3_service import S3ServiceError, download_bytes, upload_bytes
+from app.schemas import CaseCreate, CaseDetailResponse, CaseSummaryResponse, CourseCreate, CourseResponse, DocumentResponse
+from app.sheet_store import StoreError, as_int, as_optional_int, case_by_id, case_rows, courses_for_case, create_case, delete, documents_for_case, documents_for_course, find_user_by_id, insert, insert_document_record, now, replace_case, update
+
 from app.document_extract import (
     extract_afp_fields,
     extract_afp_fields_from_text,
@@ -22,12 +30,6 @@ from app.document_extract import (
     extract_pte_fields,
     extract_pte_fields_from_text,
 )
-from app.drive_service import DriveServiceError, ocr_file
-from app.eligibility import MIN_TOTAL_WEEKS, CourseInput, Stage1Input, Stage3Input, calculate_duration, check_stage1, check_stage3
-from app.models import CASE_DOC_TYPES, DocType, User, UserRole
-from app.s3_service import S3ServiceError, download_bytes, upload_bytes
-from app.schemas import CaseCreate, CaseDetailResponse, CaseSummaryResponse, CourseCreate, CourseResponse, DocumentResponse
-from app.sheet_store import StoreError, as_int, as_optional_int, case_by_id, case_rows, courses_for_case, create_case, delete, documents_for_case, documents_for_course, find_user_by_id, insert, insert_document_record, now, replace_case, update
 
 router = APIRouter(prefix="/cases", tags=["cases"])
 ALLOWED_DOC_CONTENT_TYPES = {"application/pdf", "image/jpeg", "image/png"}
@@ -771,10 +773,7 @@ async def upload_document(case_id: int, course_id: int, doc_type: DocType = Form
     file_name = f"{course['name']} - {DOCUMENT_FILE_LABELS[doc_type]}{CONTENT_TYPE_EXTENSIONS[file.content_type]}"
     s3_key = f"485_docs/{case['student_name']}-{case_id}/{file_name}"
     try:
-        # S3 is the fast, synchronous primary store -- Drive sync happens
-        # later, out-of-band, via drive_sync_worker.py (see
-        # s3-drive-sync-plan.md). insert_document_record still
-        # duplicate-checks under one lock, it just never touches Drive.
+
         upload_bytes(s3_key, content, file.content_type)
         document = insert_document_record(
             doc_type=doc_type.value,

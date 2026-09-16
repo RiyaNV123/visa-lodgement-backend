@@ -94,7 +94,15 @@ def course_response(row: dict) -> dict:
 
 
 def document_response(row: dict) -> dict:
-    return {"id": as_int(row["id"]), "doc_type": row["doc_type"], "file_name": row["file_name"], "drive_view_link": row["drive_view_link"], "uploaded_at": row["uploaded_at"]}
+    return {
+        "id": as_int(row["id"]),
+        "doc_type": row["doc_type"],
+        "file_name": row["file_name"],
+        "drive_view_link": row["drive_view_link"],
+        "uploaded_at": row["uploaded_at"],
+        "s3_key": row.get("s3_key") or None,
+        "mime_type": row.get("mime_type") or None,
+    }
 
 
 def detail_response(case: dict) -> dict:
@@ -924,29 +932,34 @@ def add_course(case_id: int, payload: CourseCreate, current_user: User = Depends
 
 
 @router.put("/{case_id}/documents/{document_id}/content", status_code=status.HTTP_204_NO_CONTENT)
-async def upload_document_content(case_id: int, document_id: int, file: UploadFile = File(...), current_user: User = Depends(get_current_user)):
-    """Uploads a document's actual bytes to S3, using the s3_key/mime_type
-    already recorded on its Documents row -- created moments earlier by
-    create_case_full_route, which knows nothing about file bytes at all, only
-    metadata. Pure S3 call, no Apps Script involved -- unlike the old
-    per-document upload endpoints below, firing many of these at once costs
-    nothing against Apps Script's global write-lock queue.
+async def upload_document_content(
+    case_id: int,
+    document_id: int,  # not looked up server-side -- see below; kept in the URL to identify which document this is
+    s3_key: str = Form(...),
+    mime_type: str = Form(...),
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+):
+    """Uploads a document's actual bytes to S3. The caller already has this
+    exact document's s3_key/mime_type straight from create_case_full_route's
+    response, so this no longer needs to read Cases/Courses/Documents to
+    look them up (the previous version of this endpoint did, which meant
+    firing several of these at once -- once per document -- was still
+    generating a burst of Apps Script reads). Now it's genuinely just an S3
+    call, plus the one Cases read scoped_case needs for the ownership
+    check -- and the key is checked against this case's own folder-naming
+    convention so a caller can't point this at a document from a different
+    case.
     """
-    scoped_case(case_id, current_user)
-    try:
-        all_docs = documents_for_case(case_id) + [
-            doc for course in courses_for_case(case_id) for doc in documents_for_course(as_int(course["id"]))
-        ]
-    except StoreError as exc:
-        raise sheet_error(exc) from exc
-    document = next((item for item in all_docs if as_int(item["id"]) == document_id), None)
-    if not document:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+    case = scoped_case(case_id, current_user)
+    expected_prefix = f"485_docs/{case['student_name']}-{case_id}/"
+    if not s3_key.startswith(expected_prefix):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid document reference for this case")
     content = await file.read()
     if len(content) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="File exceeds 15MB limit")
     try:
-        upload_bytes(document["s3_key"], content, document["mime_type"])
+        upload_bytes(s3_key, content, mime_type)
     except S3ServiceError as exc:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
 

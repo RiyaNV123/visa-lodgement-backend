@@ -40,6 +40,14 @@ class DocumentResponse(BaseModel):
     file_name: str
     drive_view_link: str
     uploaded_at: datetime
+    # Lets the frontend upload a document's bytes (PUT .../content) by
+    # passing these straight back, instead of the endpoint needing its own
+    # Sheets reads to look them up -- see create_case_full_route/
+    # upload_document_content in cases_router.py. Not sensitive: knowing a
+    # key within a private bucket grants no access without the app's own
+    # credentials, and the naming convention already embeds the case id.
+    s3_key: str | None = None
+    mime_type: str | None = None
 
     class Config:
         from_attributes = True

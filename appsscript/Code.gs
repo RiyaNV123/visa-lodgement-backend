@@ -23,6 +23,7 @@ function doPost(e) {
     else if (body.action === 'ocrFile') result = ocrFile(body.fileId);
     else if (body.action === 'initializeDataStore') result = initializeDataStore();
     else if (body.action === 'dataGet') result = { rows: getRows(body.table) };
+    else if (body.action === 'dataGetMultiple') result = { tables: getRowsMultiple(body.tables) };
     else if (body.action === 'dataInsert') result = { row: insertRow(body.table, body.row) };
     else if (body.action === 'dataUpdate') result = { row: updateRow(body.table, body.id, body.row) };
     else if (body.action === 'dataDelete') result = { deleted: deleteRow(body.table, body.id) };
@@ -126,6 +127,17 @@ function getRows(table) {
   if (sheet.getLastRow() < 2) return [];
   var values = sheet.getRange(2, 1, sheet.getLastRow() - 1, TABLE_COLUMNS[table].length).getDisplayValues();
   return values.filter(function (row) { return row[0] !== ''; }).map(function (row) { return rowToObject(table, row); });
+}
+
+// Reads several tables in one execution instead of one call per table --
+// each call the backend makes to this Web App is its own separate
+// invocation here, so a caller that needs (say) Cases, Courses, and
+// Documents together can get all three without firing three separate
+// invocations against this script's own rate/concurrency limits.
+function getRowsMultiple(tables) {
+  var out = {};
+  tables.forEach(function (table) { out[table] = getRows(table); });
+  return out;
 }
 
 // Fast O(1) id generation backed by a locked counter in Script Properties,

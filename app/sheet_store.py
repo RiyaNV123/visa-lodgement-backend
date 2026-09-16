@@ -89,6 +89,28 @@ def rows(table: str) -> list[dict]:
     return data
 
 
+def rows_multi(tables: list[str]) -> None:
+    """Reads several tables in a single Apps Script round trip (see Code.gs's
+    dataGetMultiple) instead of one call per table. Each call this backend
+    makes to Apps Script is its own separate execution there -- even several
+    calls fired concurrently from Python still count as several separate
+    executions against Apps Script's own rate/concurrency limits -- so a
+    caller that needs multiple tables together should reach for this instead
+    of firing one rows()-driven call per table. Only warms both caches (same
+    ones a plain rows(table) call would populate); it doesn't return the data
+    itself; call rows(table)/case_by_id()/courses_for_case()/etc. normally
+    afterward and they'll read from memory instead of the network.
+    """
+    data = _call({"action": "dataGetMultiple", "tables": tables}).get("tables", {})
+    now_ts = time.monotonic()
+    cache = _request_cache.get()
+    for table in tables:
+        table_rows = data.get(table, [])
+        _table_cache[table] = (now_ts, table_rows)
+        if cache is not None:
+            cache[table] = table_rows
+
+
 def insert(table: str, row: dict) -> dict:
     result = _call({"action": "dataInsert", "table": table, "row": row})["row"]
     _invalidate(table)

@@ -1,3 +1,4 @@
+import time
 from datetime import datetime, timedelta, timezone
 
 from fastapi import Depends, HTTPException, status
@@ -7,6 +8,15 @@ from passlib.context import CryptContext
 from app.config import settings
 from app.models import User
 from app.sheet_store import StoreError, find_user_by_id
+
+# Every request pays this lookup, so a blip here is the most visible/common
+# way Apps Script's own occasional flakiness (rate limits, transient
+# execution failures -- see sheet_store.py's per-call latency notes) reaches
+# a user, on an endpoint that otherwise has nothing to do with the request
+# they were making. These blips have consistently cleared within a couple of
+# seconds when observed directly, so a couple of short retries here absorbs
+# most of them before giving up with a 503.
+USER_LOOKUP_RETRY_DELAYS_SECONDS = (0.5, 1.5)
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
@@ -40,10 +50,17 @@ def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
     except JWTError:
         raise credentials_error
 
-    try:
-        user = find_user_by_id(int(user_id))
-    except StoreError as exc:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Google Sheets is temporarily unavailable") from exc
+    last_error: StoreError | None = None
+    for delay in (0, *USER_LOOKUP_RETRY_DELAYS_SECONDS):
+        if delay:
+            time.sleep(delay)
+        try:
+            user = find_user_by_id(int(user_id))
+            break
+        except StoreError as exc:
+            last_error = exc
+    else:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Google Sheets is temporarily unavailable") from last_error
     if user is None:
         raise credentials_error
     return user

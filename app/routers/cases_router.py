@@ -12,7 +12,7 @@ from app.eligibility import MIN_TOTAL_WEEKS, CourseInput, Stage1Input, Stage3Inp
 from app.models import CASE_DOC_TYPES, DocType, User, UserRole
 from app.s3_service import S3ServiceError, download_bytes, upload_bytes
 from app.schemas import CaseCreate, CaseDetailResponse, CaseSummaryResponse, CourseCreate, CourseResponse, DocumentResponse
-from app.sheet_store import StoreError, as_int, as_optional_int, case_by_id, case_rows, courses_for_case, create_case, delete, documents_for_case, documents_for_course, find_user_by_id, insert, insert_document_record, now, replace_case, update
+from app.sheet_store import StoreError, as_int, as_optional_int, case_by_id, case_rows, courses_for_case, create_case, delete, documents_for_case, documents_for_course, find_user_by_id, insert, insert_document_record, now, replace_case, rows_multi, update
 
 from app.document_extract import (
     extract_afp_fields,
@@ -498,22 +498,79 @@ def get_case(case_id: int, current_user: User = Depends(get_current_user)):
         raise sheet_error(exc) from exc
 
 
-@router.post("/{case_id}/calculate", response_model=CaseDetailResponse)
-def calculate_case(case_id: int, current_user: User = Depends(get_current_user)):
-    """Runs the qualification duration/CRICOS check and stores the result.
-    Re-running always recalculates fresh rather than only computing once --
-    and before doing so, re-extracts any course field that's still missing
-    from its already-uploaded document (see reextract_missing_course_fields),
-    so an extraction fix (or any other cause of a gap) gets picked up on the
-    next check without the student re-uploading anything. This only costs
-    extra Drive round-trips for a course that's still actually missing data;
-    a course that already has everything is untouched.
+def _iso(value: date_cls | None) -> str | None:
+    return value.isoformat() if value else None
+
+
+def _stage1_block_message(eligibility_status: str) -> tuple[str, str]:
+    # A confirmed "not_eligible" upstream is a hard stop, not just a
+    # not-yet-known state -- say so plainly instead of the vaguer "pending"
+    # wording, which implies this might resolve on its own once more data
+    # shows up (true for a genuinely pending qualification check, but
+    # misleading here).
+    if eligibility_status == "not_eligible":
+        return "not_eligible", "The qualification check is not eligible, so this cannot be checked."
+    return "pending", "Qualification check must show eligible before document validity can be checked."
+
+
+def _stage3_block_message(eligibility_status: str, document_validity_status: str) -> tuple[str, str]:
+    # Same idea as _stage1_block_message, but a lodgement date can be
+    # blocked by either (or both) of the two earlier checks at once, so the
+    # message names every blocker rather than just one.
+    not_eligible_blockers = []
+    pending_blockers = []
+    if eligibility_status == "not_eligible":
+        not_eligible_blockers.append("the qualification check")
+    elif eligibility_status != "eligible":
+        pending_blockers.append("the qualification check")
+    if document_validity_status == "not_eligible":
+        not_eligible_blockers.append("the document validity check")
+    elif document_validity_status != "eligible":
+        pending_blockers.append("the document validity check")
+    if not_eligible_blockers:
+        verb = "is" if len(not_eligible_blockers) == 1 else "are"
+        return "not_eligible", f"{' and '.join(not_eligible_blockers).capitalize()} {verb} not eligible, so a lodgement date cannot be calculated."
+    return "pending", f"{' and '.join(pending_blockers).capitalize()} must show eligible before a lodgement date can be calculated."
+
+
+@router.post("/{case_id}/run-checks", response_model=CaseDetailResponse)
+def run_checks(case_id: int, current_user: User = Depends(get_current_user)):
+    """Runs all three cascading checks -- qualification/CRICOS duration,
+    document validity, then the lodgement date -- in a single request,
+    short-circuiting exactly as before (document validity only runs once
+    qualification is eligible; lodgement date only once both are). This
+    replaces three separate endpoints (calculate/validate-documents/
+    calculate-lodgement-date) that the frontend used to call one after
+    another: each one independently re-read the Cases row over a fresh Apps
+    Script round trip (2.5-4.5s no matter how little work it does -- see
+    sheet_store.py) just to learn a status the previous call had *just*
+    written a moment earlier. Here, a later stage reads the value the
+    earlier stage computed in this same request instead, so the only Sheets
+    round trips left are the ones that read or write genuinely new data --
+    one Cases read, one Courses read, one Documents read, and one final
+    combined Cases write, regardless of which stage the case stops at.
+
+    Those three reads are also independent of each other -- none needs
+    another's result -- so they're fetched together via rows_multi in one
+    Apps Script round trip rather than one call per table. Each call this
+    backend makes to Apps Script is its own separate execution there, so
+    this also means one execution against Apps Script's own rate/concurrency
+    limits instead of three, not just a wall-clock saving. It warms the
+    process-wide table cache (see sheet_store.py's TABLE_CACHE_TTL_SECONDS),
+    so scoped_case/courses_for_case/documents_for_case below -- and every
+    later per-course Documents lookup inside reextract_missing_course_fields/
+    reextract_missing_case_fields -- read from memory instead of firing their
+    own requests.
     """
-    case = scoped_case(case_id, current_user)
     try:
+        rows_multi(["Cases", "Courses", "Documents"])
+        case = scoped_case(case_id, current_user)
         course_rows = courses_for_case(case_id)
+        case_docs = documents_for_case(case_id)
+
+        # ---- Stage 1: qualification / CRICOS duration ----
         with ThreadPoolExecutor(max_workers=max(len(course_rows), 1)) as pool:
-            rows = list(pool.map(reextract_missing_course_fields, course_rows))
+            fresh_course_rows = list(pool.map(reextract_missing_course_fields, course_rows))
         courses = [
             CourseInput(
                 id=as_int(row["id"]),
@@ -523,75 +580,49 @@ def calculate_case(case_id: int, current_user: User = Depends(get_current_user))
                 end_date=date_cls.fromisoformat(row["end_date"]) if row["end_date"] else None,
                 cricos_weeks=as_optional_int(row["cricos_weeks"]),
             )
-            for row in rows
+            for row in fresh_course_rows
         ]
-        result = calculate_duration(case["stream"], courses)
-        breakdown = {
-            "groups": [
-                {
-                    "label": group.label,
-                    "actual_weeks": group.actual_weeks,
-                    "required_weeks": group.required_weeks,
-                    "credited_weeks": group.credited_weeks,
-                }
-                for group in result.groups
-            ],
-            "total_weeks": result.total_weeks,
-            "min_required_weeks": MIN_TOTAL_WEEKS,
-        }
+        stage1 = calculate_duration(case["stream"], courses)
         updates = {
-            "eligibility_status": result.status,
-            "eligibility_reason": result.reason or "",
-            "total_duration_weeks": result.total_weeks,
-            # Persisted (not just returned) so the exact figures behind this
-            # result -- the ones a student/admin verifies the math against --
-            # are still there on the next page load, without recomputing.
-            "duration_breakdown_json": json.dumps(breakdown),
+            "eligibility_status": stage1.status,
+            "eligibility_reason": stage1.reason or "",
+            "total_duration_weeks": stage1.total_weeks,
+            "duration_breakdown_json": json.dumps({
+                "groups": [
+                    {
+                        "label": group.label,
+                        "actual_weeks": group.actual_weeks,
+                        "required_weeks": group.required_weeks,
+                        "credited_weeks": group.credited_weeks,
+                    }
+                    for group in stage1.groups
+                ],
+                "total_weeks": stage1.total_weeks,
+                "min_required_weeks": MIN_TOTAL_WEEKS,
+            }),
         }
-        updated = update("Cases", case_id, updates)
-        return detail_response(updated)
-    except StoreError as exc:
-        raise sheet_error(exc) from exc
 
-
-def _iso(value: date_cls | None) -> str | None:
-    return value.isoformat() if value else None
-
-
-@router.post("/{case_id}/validate-documents", response_model=CaseDetailResponse)
-def validate_documents(case_id: int, current_user: User = Depends(get_current_user)):
-    """Runs the document validity check (current visa/PTE/OVHC/AFP) and
-    stores the result. Confirmed rule: this only runs once the qualification
-    check is already "eligible" (read from the already-stored result, never
-    recomputed) -- checking document validity for someone who doesn't even
-    qualify on their study duration is meaningless. Re-running always
-    recalculates fresh, and before doing so, re-extracts any field still
-    missing from its already-uploaded document (see
-    reextract_missing_case_fields), same self-healing pattern as the
-    qualification check.
-    """
-    case = scoped_case(case_id, current_user)
-    try:
-        eligibility_status = case.get("eligibility_status") or "pending"
-        if eligibility_status != "eligible":
-            # A confirmed "not_eligible" upstream is a hard stop, not just a
-            # not-yet-known state -- say so plainly instead of the vaguer
-            # "pending" wording, which implies this might resolve on its own
-            # once more data shows up (true for a genuinely pending
-            # qualification check, but misleading here).
-            if eligibility_status == "not_eligible":
-                blocked_status, blocked_reason = "not_eligible", "The qualification check is not eligible, so this cannot be checked."
-            else:
-                blocked_status, blocked_reason = "pending", "Qualification check must show eligible before document validity can be checked."
-            updated = update("Cases", case_id, {
-                "document_validity_status": blocked_status,
-                "document_validity_reason": blocked_reason,
+        if stage1.status != "eligible":
+            doc_validity_status, doc_validity_reason = _stage1_block_message(stage1.status)
+            lodgement_status, lodgement_reason = _stage3_block_message(stage1.status, doc_validity_status)
+            updates.update({
+                "document_validity_status": doc_validity_status,
+                "document_validity_reason": doc_validity_reason,
                 "document_validity_breakdown_json": "",
+                "lodgement_date_status": lodgement_status,
+                "lodgement_date_reason": lodgement_reason,
+                "lodgement_date": "",
+                "lodgement_basis": "",
+                "lodgement_breakdown_json": "",
             })
+            updated = update("Cases", case_id, updates)
             return detail_response(updated)
 
+        # ---- Stage 2: document validity (current visa/PTE/OVHC/AFP) ----
         case = reextract_missing_case_fields(case)
-        case_docs = documents_for_case(case_id)
+        # case_docs was already fetched in parallel with Cases/Courses above
+        # -- reused as-is here (it can't have changed: reextract_missing_case_
+        # fields only ever writes Case-row fields, never the Documents table).
         case_doc_types = {item["doc_type"] for item in case_docs}
         stage1_input = Stage1Input(
             has_current_visa=DocType.current_visa.value in case_doc_types,
@@ -605,117 +636,72 @@ def validate_documents(case_id: int, current_user: User = Depends(get_current_us
             ovhc_relevant_date=_case_date(case, "ovhc_relevant_date"),
             afp_issue_date=_case_date(case, "afp_issue_date"),
         )
-        result = check_stage1(stage1_input, date_cls.today())
-        breakdown = {
-            "checks": [
-                {
-                    "label": "Current Visa",
-                    "extracted": {k: v for k, v in {"subclass": stage1_input.visa_subclass, "length_of_stay_date": _iso(stage1_input.visa_length_of_stay_date)}.items() if v},
-                    "rule": "Must be subclass 500, and its length-of-stay date must not have already passed",
-                },
-                {
-                    "label": "PTE",
-                    "extracted": {k: v for k, v in {"valid_until_date": _iso(stage1_input.pte_valid_until_date)}.items() if v},
-                    "rule": "Valid-until date must not have already passed",
-                },
-                {
-                    "label": "OVHC",
-                    "extracted": {k: v for k, v in {"relevant_date": _iso(stage1_input.ovhc_relevant_date)}.items() if v},
-                    "rule": "Policy start (or issue) date must already be before today",
-                },
-                {
-                    "label": "AFP (Certificate or Receipt)",
-                    "extracted": {k: v for k, v in {"issue_date": _iso(stage1_input.afp_issue_date)}.items() if v},
-                    "rule": "Receipt: presence alone is sufficient, no date check. Certificate: issue date must already be today or earlier",
-                },
-            ],
-        }
-        updates = {
-            "document_validity_status": result.status,
-            "document_validity_reason": result.reason or "",
-            # Persisted for the same reason as duration_breakdown_json above.
-            "document_validity_breakdown_json": json.dumps(breakdown),
-        }
-        updated = update("Cases", case_id, updates)
-        return detail_response(updated)
-    except StoreError as exc:
-        raise sheet_error(exc) from exc
+        stage2 = check_stage1(stage1_input, date_cls.today())
+        updates.update({
+            "document_validity_status": stage2.status,
+            "document_validity_reason": stage2.reason or "",
+            "document_validity_breakdown_json": json.dumps({
+                "checks": [
+                    {
+                        "label": "Current Visa",
+                        "extracted": {k: v for k, v in {"subclass": stage1_input.visa_subclass, "length_of_stay_date": _iso(stage1_input.visa_length_of_stay_date)}.items() if v},
+                        "rule": "Must be subclass 500, and its length-of-stay date must not have already passed",
+                    },
+                    {
+                        "label": "PTE",
+                        "extracted": {k: v for k, v in {"valid_until_date": _iso(stage1_input.pte_valid_until_date)}.items() if v},
+                        "rule": "Valid-until date must not have already passed",
+                    },
+                    {
+                        "label": "OVHC",
+                        "extracted": {k: v for k, v in {"relevant_date": _iso(stage1_input.ovhc_relevant_date)}.items() if v},
+                        "rule": "Policy start (or issue) date must already be before today",
+                    },
+                    {
+                        "label": "AFP (Certificate or Receipt)",
+                        "extracted": {k: v for k, v in {"issue_date": _iso(stage1_input.afp_issue_date)}.items() if v},
+                        "rule": "Receipt: presence alone is sufficient, no date check. Certificate: issue date must already be today or earlier",
+                    },
+                ],
+            }),
+        })
 
-
-@router.post("/{case_id}/calculate-lodgement-date", response_model=CaseDetailResponse)
-def calculate_lodgement_date(case_id: int, current_user: User = Depends(get_current_user)):
-    """Runs the lodgement date calculation -- a third check with its own
-    status/reason/breakdown, not combined with the other two into a single
-    verdict. Confirmed rule: it refuses to run unless BOTH the qualification
-    check and the document validity check are already "eligible" (read from
-    their already-stored results, never recomputed) -- a lodgement date is
-    meaningless for someone who doesn't qualify, or whose visa/PTE/OVHC/AFP
-    aren't currently valid. Re-running always recalculates fresh, and before
-    doing so, re-extracts a still-missing New CoE start date from an
-    already-uploaded document (self-healing, same pattern as the other two
-    checks).
-    """
-    case = scoped_case(case_id, current_user)
-    try:
-        eligibility_status = case.get("eligibility_status") or "pending"
-        document_validity_status = case.get("document_validity_status") or "pending"
-        not_eligible_blockers = []
-        pending_blockers = []
-        if eligibility_status == "not_eligible":
-            not_eligible_blockers.append("the qualification check")
-        elif eligibility_status != "eligible":
-            pending_blockers.append("the qualification check")
-        if document_validity_status == "not_eligible":
-            not_eligible_blockers.append("the document validity check")
-        elif document_validity_status != "eligible":
-            pending_blockers.append("the document validity check")
-        if not_eligible_blockers or pending_blockers:
-            # A confirmed "not_eligible" upstream is a hard stop -- say so
-            # plainly rather than the vaguer "pending" wording, which implies
-            # this might resolve on its own once more data shows up (true for
-            # a genuinely pending check, but misleading here). If any
-            # blocker is a hard failure, that takes priority in the message
-            # even if another blocker is merely still pending.
-            if not_eligible_blockers:
-                blocked_status = "not_eligible"
-                verb = "is" if len(not_eligible_blockers) == 1 else "are"
-                blocked_reason = f"{' and '.join(not_eligible_blockers).capitalize()} {verb} not eligible, so a lodgement date cannot be calculated."
-            else:
-                blocked_status = "pending"
-                blocked_reason = f"{' and '.join(pending_blockers).capitalize()} must show eligible before a lodgement date can be calculated."
-            updated = update("Cases", case_id, {
-                "lodgement_date_status": blocked_status,
-                "lodgement_date_reason": blocked_reason,
+        if stage2.status != "eligible":
+            lodgement_status, lodgement_reason = _stage3_block_message(stage1.status, stage2.status)
+            updates.update({
+                "lodgement_date_status": lodgement_status,
+                "lodgement_date_reason": lodgement_reason,
                 "lodgement_date": "",
                 "lodgement_basis": "",
                 "lodgement_breakdown_json": "",
             })
+            updated = update("Cases", case_id, updates)
             return detail_response(updated)
 
-        case = reextract_missing_case_fields(case)
-        rows = courses_for_case(case_id)
-        completion_dates = [date_cls.fromisoformat(row["end_date"]) for row in rows if row.get("end_date")]
+        # ---- Stage 3: lodgement date ----
+        # Reuses fresh_course_rows from stage 1 rather than re-reading
+        # Courses -- it already reflects any self-healing write stage 1 just
+        # made, which a fresh read would too, but at the cost of a Sheets
+        # round trip for data we already have in hand.
+        completion_dates = [date_cls.fromisoformat(row["end_date"]) for row in fresh_course_rows if row.get("end_date")]
         latest_completion_date = max(completion_dates) if completion_dates else None
-
         stage3_input = Stage3Input(
             latest_completion_date=latest_completion_date,
             visa_length_of_stay_date=_case_date(case, "visa_length_of_stay_date"),
             new_coe_start_date=_case_date(case, "new_coe_start_date"),
         )
-        result = check_stage3(stage3_input, date_cls.today())
-        breakdown = {
-            "latest_completion_date": _iso(latest_completion_date),
-            "window_end": _iso(result.window_end),
-            "factors": [{"label": f.label, "date": _iso(f.date), "included": f.included} for f in result.factors],
-        }
-        updates = {
-            "lodgement_date_status": result.status,
-            "lodgement_date_reason": result.reason or "",
-            "lodgement_date": result.lodgement_date.isoformat() if result.lodgement_date else "",
-            "lodgement_basis": result.lodgement_basis or "",
-            # Persisted for the same reason as duration_breakdown_json above.
-            "lodgement_breakdown_json": json.dumps(breakdown),
-        }
+        stage3 = check_stage3(stage3_input, date_cls.today())
+        updates.update({
+            "lodgement_date_status": stage3.status,
+            "lodgement_date_reason": stage3.reason or "",
+            "lodgement_date": stage3.lodgement_date.isoformat() if stage3.lodgement_date else "",
+            "lodgement_basis": stage3.lodgement_basis or "",
+            "lodgement_breakdown_json": json.dumps({
+                "latest_completion_date": _iso(latest_completion_date),
+                "window_end": _iso(stage3.window_end),
+                "factors": [{"label": f.label, "date": _iso(f.date), "included": f.included} for f in stage3.factors],
+            }),
+        })
         updated = update("Cases", case_id, updates)
         return detail_response(updated)
     except StoreError as exc:

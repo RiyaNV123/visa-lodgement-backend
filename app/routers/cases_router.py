@@ -7,7 +7,6 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, s
 from app.auth import get_current_user
 from app.cricos_lookup import CricosLookupError, lookup_duration_weeks
 
-from app.drive_service import DriveServiceError, ocr_file
 from app.eligibility import MIN_TOTAL_WEEKS, CourseInput, Stage1Input, Stage3Input, calculate_duration, check_stage1, check_stage3
 from app.models import CASE_DOC_TYPES, DocType, User, UserRole
 from app.s3_service import S3ServiceError, download_bytes, upload_bytes
@@ -29,6 +28,7 @@ from app.document_extract import (
     extract_ovhc_fields_from_text,
     extract_pte_fields,
     extract_pte_fields_from_text,
+    ocr_pdf_bytes,
 )
 
 router = APIRouter(prefix="/cases", tags=["cases"])
@@ -181,38 +181,37 @@ def detail_response_from_fresh_courses(case: dict, courses: list[dict]) -> dict:
     return {"id": case_id, "student_name": case["student_name"], "stream": case["stream"], "status": case["status"], "created_at": case["created_at"], "owner_email": owner.email if owner else None, "courses": courses_out}
 
 
-def _completion_letter_fields(content: bytes, drive_file_id: str) -> dict:
+def _completion_letter_fields(content: bytes) -> dict:
     """Regex extraction against the PDF's own embedded text; if that comes up
     empty, it means the document is scanned/image-based with no text layer at
     all (not a pattern-matching gap -- there's nothing there to search), so
-    this falls back to Drive's own OCR conversion and runs the exact same
-    patterns against the text OCR recovers instead.
+    this falls back to a local OCR pass over the document's own embedded scan
+    image (see ocr_pdf_bytes) and runs the exact same patterns against the
+    text that recovers instead.
     """
     fields = extract_completion_letter_fields(content)
     if fields:
         return fields
-    try:
-        text = ocr_file(drive_file_id)
-    except DriveServiceError:
+    text = ocr_pdf_bytes(content)
+    if not text:
         return {}
     return extract_completion_letter_fields_from_text(text)
 
 
-def _coe_fields(content: bytes, drive_file_id: str) -> dict:
+def _coe_fields(content: bytes) -> dict:
     """Same idea as _completion_letter_fields, for a CoE's CRICOS code."""
     fields = extract_coe_fields(content)
     if fields.get("cricos_code"):
         return fields
-    try:
-        text = ocr_file(drive_file_id)
-    except DriveServiceError:
+    text = ocr_pdf_bytes(content)
+    if not text:
         return fields
     return extract_coe_fields_from_text(text)
 
 
-def extract_and_store_course_fields(course: dict, doc_type: str, content: bytes, drive_file_id: str) -> None:
+def extract_and_store_course_fields(course: dict, doc_type: str, content: bytes) -> None:
     """Best-effort: after a CoE or Completion Letter upload, extracts
-    whatever that document type is responsible for (regex first, OCR
+    whatever that document type is responsible for (regex first, local OCR
     fallback for a scanned document) and writes it onto the Course row.
     Never raises -- the document itself is already safely uploaded
     regardless of whether extraction finds anything; a miss just leaves the
@@ -223,14 +222,14 @@ def extract_and_store_course_fields(course: dict, doc_type: str, content: bytes,
     """
     course_id = as_int(course["id"])
     if doc_type == DocType.completion_letter.value:
-        fields = _completion_letter_fields(content, drive_file_id)
+        fields = _completion_letter_fields(content)
         if fields:
             try:
                 update("Courses", course_id, fields)
             except StoreError:
                 pass
     elif doc_type == DocType.coe.value:
-        fields = _coe_fields(content, drive_file_id)
+        fields = _coe_fields(content)
         cricos_code = fields.get("cricos_code")
         if not cricos_code:
             return
@@ -274,7 +273,7 @@ def reextract_missing_course_fields(course: dict) -> dict:
             return {}
         try:
             content = download_bytes(doc["s3_key"])
-            fields = _completion_letter_fields(content, doc["drive_file_id"])
+            fields = _completion_letter_fields(content)
         except S3ServiceError:
             fields = {}
         return {key: fields[key] for key in ("start_date", "end_date") if fields.get(key) and not course.get(key)}
@@ -287,7 +286,7 @@ def reextract_missing_course_fields(course: dict) -> dict:
             return {}
         try:
             content = download_bytes(doc["s3_key"])
-            fields = _coe_fields(content, doc["drive_file_id"])
+            fields = _coe_fields(content)
         except S3ServiceError:
             fields = {}
         cricos_code = fields.get("cricos_code")
@@ -339,12 +338,13 @@ CASE_FIELD_EXTRACTORS = {
 }
 
 
-def _case_doc_fields(doc_type: str, content: bytes, drive_file_id: str) -> dict:
+def _case_doc_fields(doc_type: str, content: bytes) -> dict:
     """Regex extraction against the document's own embedded text; if that
     comes up empty (a scanned/image-based document with no text layer at
-    all), falls back to Drive's OCR conversion and runs the exact same
-    patterns against the recovered text -- same approach as the qualification
-    documents' _completion_letter_fields/_coe_fields.
+    all), falls back to a local OCR pass over the document's own embedded
+    scan image (see ocr_pdf_bytes) and runs the exact same patterns against
+    the recovered text -- same approach as the qualification documents'
+    _completion_letter_fields/_coe_fields.
     """
     entry = CASE_FIELD_EXTRACTORS.get(doc_type)
     if not entry:
@@ -353,14 +353,13 @@ def _case_doc_fields(doc_type: str, content: bytes, drive_file_id: str) -> dict:
     fields = extractor_bytes(content)
     if fields:
         return fields
-    try:
-        text = ocr_file(drive_file_id)
-    except DriveServiceError:
+    text = ocr_pdf_bytes(content)
+    if not text:
         return {}
     return extractor_text(text)
 
 
-def extract_and_store_case_fields(case_id: int, doc_type: str, content: bytes, drive_file_id: str) -> None:
+def extract_and_store_case_fields(case_id: int, doc_type: str, content: bytes) -> None:
     """Best-effort: after a Current Visa/PTE/OVHC/AFP upload, extracts
     whatever that document type is responsible for and writes it onto the
     Case row (these are one-per-case, not one-per-course, so they live
@@ -371,7 +370,7 @@ def extract_and_store_case_fields(case_id: int, doc_type: str, content: bytes, d
     if not entry:
         return
     _, _, field_map = entry
-    fields = _case_doc_fields(doc_type, content, drive_file_id)
+    fields = _case_doc_fields(doc_type, content)
     if not fields:
         return
     updates = {column: fields[key] for key, column in field_map.items() if fields.get(key)}
@@ -412,7 +411,7 @@ def reextract_missing_case_fields(case: dict) -> dict:
             return {}
         try:
             content = download_bytes(doc["s3_key"])
-            fields = _case_doc_fields(DocType.current_visa.value, content, doc["drive_file_id"])
+            fields = _case_doc_fields(DocType.current_visa.value, content)
         except S3ServiceError:
             fields = {}
         result = {}
@@ -430,7 +429,7 @@ def reextract_missing_case_fields(case: dict) -> dict:
             return {}
         try:
             content = download_bytes(doc["s3_key"])
-            fields = _case_doc_fields(DocType.pte.value, content, doc["drive_file_id"])
+            fields = _case_doc_fields(DocType.pte.value, content)
         except S3ServiceError:
             fields = {}
         return {"pte_valid_until_date": fields["valid_until_date"]} if fields.get("valid_until_date") else {}
@@ -443,7 +442,7 @@ def reextract_missing_case_fields(case: dict) -> dict:
             return {}
         try:
             content = download_bytes(doc["s3_key"])
-            fields = _case_doc_fields(DocType.ovhc.value, content, doc["drive_file_id"])
+            fields = _case_doc_fields(DocType.ovhc.value, content)
         except S3ServiceError:
             fields = {}
         return {"ovhc_relevant_date": fields["relevant_date"]} if fields.get("relevant_date") else {}
@@ -456,7 +455,7 @@ def reextract_missing_case_fields(case: dict) -> dict:
             return {}
         try:
             content = download_bytes(doc["s3_key"])
-            fields = _case_doc_fields(doc["doc_type"], content, doc["drive_file_id"])
+            fields = _case_doc_fields(doc["doc_type"], content)
         except S3ServiceError:
             fields = {}
         return {"afp_issue_date": fields["issue_date"]} if fields.get("issue_date") else {}
@@ -469,7 +468,7 @@ def reextract_missing_case_fields(case: dict) -> dict:
             return {}
         try:
             content = download_bytes(doc["s3_key"])
-            fields = _case_doc_fields(DocType.new_coe.value, content, doc["drive_file_id"])
+            fields = _case_doc_fields(DocType.new_coe.value, content)
         except S3ServiceError:
             fields = {}
         return {"new_coe_start_date": fields["start_date"]} if fields.get("start_date") else {}
@@ -540,16 +539,19 @@ def case_payload_full(payload: CaseCreateFull, owner_id: int) -> tuple[dict, lis
 
 
 def _extract_preview_fields(doc_type: DocType, content: bytes) -> dict:
-    """Regex-only extraction, no OCR fallback -- there's no Drive file to OCR
-    against yet at this stage, since nothing has been persisted anywhere
-    (see extract_preview below). Same patterns a real upload always used;
-    only which field(s) come back, and under which response key, changes per
-    doc_type.
+    """Runs the exact same extraction a real upload always does -- regex
+    first, local OCR fallback for a scanned/photographed document with no
+    text layer (see _completion_letter_fields/_coe_fields/_case_doc_fields
+    and document_extract.ocr_pdf_bytes) -- against bytes that haven't been
+    saved anywhere yet. OCR runs entirely on this server now, so it no
+    longer needs a Drive file id to exist first, which is what used to make
+    OCR unavailable at this stage (and unreliable even later, until the
+    async Drive-sync worker had caught up).
     """
     if doc_type == DocType.completion_letter:
-        return extract_completion_letter_fields(content)
+        return _completion_letter_fields(content)
     if doc_type == DocType.coe:
-        fields = extract_coe_fields(content)
+        fields = _coe_fields(content)
         cricos_code = fields.get("cricos_code")
         if not cricos_code:
             return {}
@@ -562,10 +564,10 @@ def _extract_preview_fields(doc_type: DocType, content: bytes) -> dict:
             result["cricos_weeks"] = weeks
         return result
     if doc_type == DocType.new_coe:
-        fields = extract_new_coe_fields(content)
+        fields = _case_doc_fields(DocType.new_coe.value, content)
         return {"new_coe_start_date": fields["start_date"]} if fields.get("start_date") else {}
     if doc_type == DocType.current_visa:
-        fields = extract_current_visa_fields(content)
+        fields = _case_doc_fields(DocType.current_visa.value, content)
         result = {}
         if fields.get("visa_subclass"):
             result["visa_subclass"] = fields["visa_subclass"]
@@ -573,13 +575,13 @@ def _extract_preview_fields(doc_type: DocType, content: bytes) -> dict:
             result["visa_length_of_stay_date"] = fields["length_of_stay_date"]
         return result
     if doc_type == DocType.pte:
-        fields = extract_pte_fields(content)
+        fields = _case_doc_fields(DocType.pte.value, content)
         return {"pte_valid_until_date": fields["valid_until_date"]} if fields.get("valid_until_date") else {}
     if doc_type == DocType.ovhc:
-        fields = extract_ovhc_fields(content)
+        fields = _case_doc_fields(DocType.ovhc.value, content)
         return {"ovhc_relevant_date": fields["relevant_date"]} if fields.get("relevant_date") else {}
     if doc_type in (DocType.afp_certificate, DocType.afp_receipt):
-        fields = extract_afp_fields(content)
+        fields = _case_doc_fields(doc_type.value, content)
         return {"afp_issue_date": fields["issue_date"]} if fields.get("issue_date") else {}
     return {}  # transcript, academic_certificate: nothing auto-extracted, matches today
 
@@ -591,7 +593,8 @@ async def extract_preview(doc_type: DocType = Form(...), file: UploadFile = File
     the frontend show a student what was found in a document the instant
     they attach it (well before Save), holding the result locally until
     create_case_full below actually persists it. Costs at most one external
-    CRICOS-registry call; zero Apps Script calls.
+    CRICOS-registry call plus, for a scanned document, a local OCR pass;
+    zero Apps Script calls.
     """
     if file.content_type not in ALLOWED_DOC_CONTENT_TYPES:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only PDF, JPG, or PNG files are allowed")
@@ -962,7 +965,7 @@ async def upload_document(case_id: int, course_id: int, doc_type: DocType = Form
             uploaded_at=now(),
             course_id=course_id,
         )
-        extract_and_store_course_fields(course, doc_type.value, content, drive_file_id="")
+        extract_and_store_course_fields(course, doc_type.value, content)
         return document_response(document)
     except (StoreError, S3ServiceError) as exc:
         # Same "Error: CODE" vs. bare-code mismatch as DUPLICATE_CASE/
@@ -994,7 +997,7 @@ async def upload_case_level_document(case_id: int, doc_type: DocType = Form(...)
             uploaded_at=now(),
             case_id=case_id,
         )
-        extract_and_store_case_fields(case_id, doc_type.value, content, drive_file_id="")
+        extract_and_store_case_fields(case_id, doc_type.value, content)
         return document_response(document)
     except (StoreError, S3ServiceError) as exc:
         # Same "Error: CODE" vs. bare-code mismatch as DUPLICATE_CASE/

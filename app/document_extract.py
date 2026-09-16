@@ -13,7 +13,13 @@ import io
 import re
 from datetime import date
 
+import pytesseract
 from pypdf import PdfReader
+
+from app.config import settings
+
+if settings.tesseract_cmd:
+    pytesseract.pytesseract.tesseract_cmd = settings.tesseract_cmd
 
 MONTH_NAMES = "jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec"
 MONTH_FULL = (
@@ -104,6 +110,30 @@ def extract_pdf_text(content: bytes) -> str:
     try:
         reader = PdfReader(io.BytesIO(content))
         return "\n".join(page.extract_text() or "" for page in reader.pages)
+    except Exception:
+        return ""
+
+
+def ocr_pdf_bytes(content: bytes) -> str:
+    """Fallback for a scanned/photographed document with no embedded text
+    layer at all (extract_pdf_text comes back empty for these -- nothing to
+    search, not a pattern-matching gap). Runs entirely on this server: pulls
+    each page's own embedded scan image straight out of the PDF (pypdf, pure
+    Python -- no page-rendering engine needed, since a scanned page's
+    "content" already *is* one embedded image) and reads it with a local
+    Tesseract OCR install. No Drive/Apps Script/network round trip, so
+    unlike the old Drive-OCR path this doesn't need the document to already
+    be uploaded anywhere first -- it works straight off the bytes in hand,
+    even before anything's been saved (see cases_router.py's extract-preview
+    endpoint).
+    """
+    try:
+        reader = PdfReader(io.BytesIO(content))
+        parts = []
+        for page in reader.pages:
+            for image_file in page.images:
+                parts.append(pytesseract.image_to_string(image_file.image))
+        return "\n".join(parts)
     except Exception:
         return ""
 

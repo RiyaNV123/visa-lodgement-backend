@@ -237,6 +237,8 @@ START_BLOCK_KEYS = [
     "commencement date",
     "course start date",
     "start date",
+    "enrollment date",
+    "enrolment date",
     "commencement",
 ]
 END_BLOCK_KEYS = [
@@ -266,6 +268,12 @@ START_LABEL_PATTERNS = [
     r"course\s+commencement\s*\n?\s*date\s*:?",
     r"course\s+start\s*\n?\s*date\s*:?",
     r"commencement\s*\n?\s*date\s*:?",
+    # "Enrollment Date"/"Enrolment Date" -- a completely different label
+    # wording seen on a real sample (an institution that frames the same
+    # concept as "when they enrolled" rather than "when the course
+    # commenced/started"), same date the other commencement-date variants
+    # are looking for.
+    r"enrol{1,2}ment\s*\n?\s*date\s*:?",
     # Bare "Commencement:" with no "Date" after it -- seen on a real sample.
     # Tried last since it's the least specific: only falls back to this once
     # every "...commencement date..." variant above has already missed.

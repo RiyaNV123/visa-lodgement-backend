@@ -30,6 +30,7 @@ function doPost(e) {
     else if (body.action === 'replaceCaseQualifications') result = replaceCaseQualifications(body.caseId, body.caseRow, body.courses);
     else if (body.action === 'createUser') result = createUser(body.row);
     else if (body.action === 'createCaseWithCourses') result = createCaseWithCourses(body.caseRow, body.courses);
+    else if (body.action === 'createCaseFull') result = createCaseFull(body);
     else if (body.action === 'insertDocumentRecord') result = { document: insertDocumentRecord(body) };
     else return jsonResponse({ ok: false, error: 'Unknown action: ' + body.action });
 
@@ -238,6 +239,67 @@ function createCaseWithCourses(caseRow, courses) {
   });
 }
 
+// Creates an entire case in ONE locked execution: the Case row (with
+// whatever visa/PTE/OVHC/AFP fields the backend already extracted before
+// calling this -- see cases_router.py's extract-preview endpoint), every
+// Course row (dates/CRICOS code/weeks already known, same reason), and
+// every Document row for both the qualification and case-level documents
+// (metadata only -- s3_key is computed here since this is the first place
+// the real case id exists to build it from; the backend uploads the actual
+// bytes to that key in a separate, unlocked, S3-only follow-up call per
+// file). Replaces what used to be createCaseWithCourses (1 locked call) +
+// one insertDocumentRecord + one dataUpdate per document (up to 2 more
+// locked calls each) -- a case with a dozen documents used to queue up
+// dozens of serialized lock acquisitions; this is exactly one, regardless
+// of how many qualifications or documents the case has. No per-document
+// duplicate check is needed (unlike insertDocumentRecord) -- this only ever
+// creates a brand-new case, so there's no pre-existing row it could collide
+// with.
+function createCaseFull(payload) {
+  return withLock(function () {
+    var existing = getRows('Cases').filter(function (c) { return String(c.owner_user_id) === String(payload.caseRow.owner_user_id); });
+    if (existing.length) throw new Error('DUPLICATE_CASE');
+
+    var createdCase = appendRecord('Cases', payload.caseRow);
+    var folderName = payload.caseRow.student_name + '-' + createdCase.id;
+
+    function buildDocumentRecord(doc, courseId, caseId) {
+      return appendRecord('Documents', {
+        course_id: courseId || '',
+        case_id: caseId || '',
+        doc_type: doc.doc_type,
+        file_name: doc.file_name,
+        s3_key: '485_docs/' + folderName + '/' + doc.file_name,
+        mime_type: doc.mime_type,
+        drive_file_id: '',
+        drive_view_link: '',
+        drive_sync_status: 'pending',
+        synced_at: '',
+        retry_count: 0,
+        last_error: '',
+        uploaded_at: payload.uploadedAt
+      });
+    }
+
+    var createdCourses = (payload.courses || []).map(function (course) {
+      var courseDocs = course.documents || [];
+      var courseInput = Object.assign({}, course, { case_id: createdCase.id });
+      delete courseInput.documents;
+      var createdCourse = appendRecord('Courses', courseInput);
+      createdCourse.documents = courseDocs.map(function (doc) {
+        return buildDocumentRecord(doc, createdCourse.id, null);
+      });
+      return createdCourse;
+    });
+
+    var createdCaseDocuments = (payload.caseDocuments || []).map(function (doc) {
+      return buildDocumentRecord(doc, null, createdCase.id);
+    });
+
+    return { caseRow: createdCase, courses: createdCourses, caseDocuments: createdCaseDocuments };
+  });
+}
+
 // S3-primary pipeline: the file already went straight to S3 from the
 // backend (fast, synchronous) -- this just records the Documents row with
 // no Drive involvement at all. drive_sync_worker.py fills in drive_file_id/
@@ -257,8 +319,11 @@ function insertDocumentRecord(body) {
     if (existing.length) throw new Error('DUPLICATE_DOCUMENT');
   }
 
-  withLock(checkDuplicate);
-
+  // One lock acquisition, not two -- there's no work between a first
+  // check and the insert below (unlike the upload endpoints' old Drive
+  // round-trip, which this pattern predates), so checking twice under two
+  // separate lock acquisitions only doubled this document's contribution to
+  // the script's global write-lock queue for no benefit.
   return withLock(function () {
     checkDuplicate();
     return appendRecord('Documents', {

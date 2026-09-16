@@ -224,6 +224,29 @@ def create_case(row: dict, courses: list[dict]) -> tuple[dict, list[dict]]:
     return data["caseRow"], data["courses"]
 
 
+def create_case_full(case_row: dict, courses: list[dict], case_documents: list[dict], uploaded_at: str) -> dict:
+    """Creates an entire case -- the Case row, every Course row (dates/CRICOS
+    already known), and every Document row's metadata for both qualification
+    and case-level documents (s3_key computed server-side in Code.gs, since
+    the real case id doesn't exist until this call assigns it) -- in a single
+    Apps Script round trip (server-side action `createCaseFull`). Replaces
+    create_case() + one insert_document_record() + up to one field-update per
+    document that the old upload-per-document flow needed, collapsing what
+    used to be dozens of serialized locked writes (Apps Script's write lock
+    is global to the whole script) down to exactly one, regardless of how
+    many qualifications/documents the case has. Callers still upload each
+    document's actual bytes to S3 afterward, using the s3_key this returns --
+    that part is unlocked and was never the bottleneck. Raises
+    StoreError("DUPLICATE_CASE") if the owner already has a case, same as
+    create_case().
+    """
+    data = _call({"action": "createCaseFull", "caseRow": case_row, "courses": courses, "caseDocuments": case_documents, "uploadedAt": uploaded_at})
+    _invalidate("Cases")
+    _invalidate("Courses")
+    _invalidate("Documents")
+    return data
+
+
 def replace_case(case_id: int, case_row: dict, courses: list[dict]) -> tuple[dict, list[dict]]:
     data = _call({"action": "replaceCaseQualifications", "caseId": str(case_id), "caseRow": case_row, "courses": courses})
     _invalidate("Cases")

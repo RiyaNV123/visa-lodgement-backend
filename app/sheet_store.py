@@ -79,6 +79,20 @@ def _invalidate(table: str) -> None:
     _table_cache.pop(table, None)
 
 
+def invalidate(table: str) -> None:
+    """Public entry point for a caller that wrote to `table` from a
+    different thread than the one that will read it back next (e.g. a
+    per-course worker thread in a ThreadPoolExecutor) -- contextvars.ContextVar
+    isn't shared across threads, so that worker's own update() call already
+    invalidated the process-wide TABLE_CACHE_TTL_SECONDS cache, but couldn't
+    reach the *calling* thread's short-lived per-request cache. Call this
+    from the original (calling) thread, after the worker(s) finish, to make
+    sure the next read on this thread is genuinely fresh instead of serving
+    whatever this thread cached before the write happened.
+    """
+    _invalidate(table)
+
+
 def rows(table: str) -> list[dict]:
     cache = _request_cache.get()
     if cache is not None and table in cache:

@@ -11,7 +11,7 @@ from app.eligibility import MIN_TOTAL_WEEKS, CourseInput, Stage1Input, Stage3Inp
 from app.models import CASE_DOC_TYPES, DocType, User, UserRole
 from app.s3_service import S3ServiceError, download_bytes, upload_bytes
 from app.schemas import CaseCreate, CaseCreateFull, CaseDetailResponse, CaseSummaryResponse, CourseCreate, CourseResponse, DocumentResponse, ExtractPreviewResponse
-from app.sheet_store import StoreError, as_int, as_optional_int, case_by_id, case_rows, courses_for_case, create_case, create_case_full, delete, documents_for_case, documents_for_course, find_user_by_id, insert, insert_document_record, now, replace_case, rows_multi, update
+from app.sheet_store import StoreError, as_int, as_optional_int, case_by_id, case_rows, courses_for_case, create_case, create_case_full, delete, documents_for_case, documents_for_course, find_user_by_id, insert, insert_document_record, invalidate, now, replace_case, rows_multi, update
 
 from app.document_extract import (
     extract_afp_fields,
@@ -739,6 +739,16 @@ def run_checks(case_id: int, current_user: User = Depends(get_current_user)):
         # ---- Stage 1: qualification / CRICOS duration ----
         with ThreadPoolExecutor(max_workers=max(len(course_rows), 1)) as pool:
             fresh_course_rows = list(pool.map(reextract_missing_course_fields, course_rows))
+        # Self-healing above runs on worker threads; a thread that wrote a
+        # newly-extracted field there couldn't invalidate *this* thread's
+        # own request-scoped cache (see sheet_store.invalidate). Without
+        # this, detail_response()'s later courses_for_case() call would
+        # serve the pre-heal rows it already cached at the top of this
+        # request -- correct for calculate_duration below (it uses
+        # fresh_course_rows directly, not the cache), but stale in the
+        # response the student actually sees.
+        if any(row is not course for row, course in zip(fresh_course_rows, course_rows)):
+            invalidate("Courses")
         courses = [
             CourseInput(
                 id=as_int(row["id"]),

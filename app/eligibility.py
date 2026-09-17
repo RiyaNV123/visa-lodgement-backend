@@ -184,25 +184,25 @@ def check_stage1(data: Stage1Input, today: date) -> Stage1Result:
     if not data.visa_subclass or not data.visa_length_of_stay_date:
         return Stage1Result("pending", "Current Visa details not yet extracted")
     if data.visa_subclass != "500":
-        return Stage1Result("not_eligible", "Current visa is not subclass 500")
+        return Stage1Result("not_eligible", "Current visa is not subclass 500.")
     if data.visa_length_of_stay_date < today:
-        return Stage1Result("not_eligible", f"Current visa has expired (length of stay: {data.visa_length_of_stay_date.isoformat()})")
+        return Stage1Result("not_eligible", "Current visa has expired.")
 
     if not data.pte_valid_until_date:
         return Stage1Result("pending", "PTE valid-until date not yet extracted")
     if data.pte_valid_until_date < today:
-        return Stage1Result("not_eligible", f"PTE score has expired (valid until: {data.pte_valid_until_date.isoformat()})")
+        return Stage1Result("not_eligible", "PTE score has expired.")
 
     if not data.ovhc_relevant_date:
         return Stage1Result("pending", "OVHC relevant date not yet extracted")
     if data.ovhc_relevant_date > today:
-        return Stage1Result("not_eligible", f"OVHC policy hasn't started yet (date: {data.ovhc_relevant_date.isoformat()})")
+        return Stage1Result("not_eligible", "OVHC policy hasn't started yet.")
 
     if not data.has_afp_receipt:
         if not data.afp_issue_date:
             return Stage1Result("pending", "AFP issue date not yet extracted")
         if data.afp_issue_date > today:
-            return Stage1Result("not_eligible", f"AFP document hasn't been issued yet (date: {data.afp_issue_date.isoformat()})")
+            return Stage1Result("not_eligible", "AFP document hasn't been issued yet.")
 
     return Stage1Result("eligible", None)
 

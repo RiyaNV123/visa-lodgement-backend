@@ -691,22 +691,18 @@ def _stage1_block_message(eligibility_status: str) -> tuple[str, str]:
 
 def _stage3_block_message(eligibility_status: str, document_validity_status: str) -> tuple[str, str]:
     # Same idea as _stage1_block_message, but a lodgement date can be
-    # blocked by either (or both) of the two earlier checks at once, so the
-    # message names every blocker rather than just one.
-    not_eligible_blockers = []
-    pending_blockers = []
-    if eligibility_status == "not_eligible":
-        not_eligible_blockers.append("the qualification check")
-    elif eligibility_status != "eligible":
-        pending_blockers.append("the qualification check")
-    if document_validity_status == "not_eligible":
-        not_eligible_blockers.append("the document validity check")
-    elif document_validity_status != "eligible":
-        pending_blockers.append("the document validity check")
-    if not_eligible_blockers:
-        verb = "is" if len(not_eligible_blockers) == 1 else "are"
-        return "not_eligible", f"{' and '.join(not_eligible_blockers).capitalize()} {verb} not eligible, so a lodgement date cannot be calculated."
-    return "pending", f"{' and '.join(pending_blockers).capitalize()} must show eligible before a lodgement date can be calculated."
+    # blocked by either (or both) of the two earlier checks at once. Kept
+    # short -- which check failed and why is already visible in that check's
+    # own column, so this only needs to name the blocker, not repeat it.
+    qualification_blocked = eligibility_status == "not_eligible"
+    documents_blocked = document_validity_status == "not_eligible"
+    if qualification_blocked and documents_blocked:
+        return "not_eligible", "Qualification and documents are not valid."
+    if qualification_blocked:
+        return "not_eligible", "Qualification is not eligible."
+    if documents_blocked:
+        return "not_eligible", "Documents are not valid."
+    return "pending", "Qualification check and document validity must both show eligible before a lodgement date can be calculated."
 
 
 @router.post("/{case_id}/run-checks", response_model=CaseDetailResponse)

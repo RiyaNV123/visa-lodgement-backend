@@ -23,6 +23,13 @@ class Settings(BaseSettings):
     sync_worker_max_retries: int = 5
     sync_worker_stuck_timeout_seconds: int = 300
 
+    # Local OCR fallback (see document_extract.ocr_pdf_bytes) -- runs
+    # entirely on this server, no Drive/Apps Script involved. Left blank on
+    # Linux (the VPS) once `apt install tesseract-ocr` puts it on PATH;
+    # Windows dev machines need the full path since winget doesn't put it on
+    # PATH for an already-running shell.
+    tesseract_cmd: str = ""
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]

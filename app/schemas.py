@@ -40,6 +40,14 @@ class DocumentResponse(BaseModel):
     file_name: str
     drive_view_link: str
     uploaded_at: datetime
+    # Lets the frontend upload a document's bytes (PUT .../content) by
+    # passing these straight back, instead of the endpoint needing its own
+    # Sheets reads to look them up -- see create_case_full_route/
+    # upload_document_content in cases_router.py. Not sensitive: knowing a
+    # key within a private bucket grants no access without the app's own
+    # credentials, and the naming convention already embeds the case id.
+    s3_key: str | None = None
+    mime_type: str | None = None
 
     class Config:
         from_attributes = True
@@ -129,12 +137,64 @@ class LodgementBreakdown(BaseModel):
     factors: list[LodgementFactorBreakdown]
 
 
+# ---------- Extraction preview ----------
+# Returned by POST /cases/extract-preview -- runs the same regex/CRICOS-
+# lookup extraction a document upload always has, but against bytes that
+# haven't been saved anywhere (no S3 write, no Sheets write). Used so the
+# frontend can show a student what was found in a document the moment they
+# attach it, well before Save, and hold the result locally until then.
+
+class ExtractPreviewResponse(BaseModel):
+    start_date: date | None = None
+    end_date: date | None = None
+    cricos_code: str | None = None
+    cricos_weeks: int | None = None
+    visa_subclass: str | None = None
+    visa_length_of_stay_date: date | None = None
+    pte_valid_until_date: date | None = None
+    ovhc_relevant_date: date | None = None
+    afp_issue_date: date | None = None
+    new_coe_start_date: date | None = None
+
+
 # ---------- Cases ----------
 
 class CaseCreate(BaseModel):
     student_name: str = Field(min_length=1, max_length=255)
     stream: Stream
     courses: list[CourseCreate] = []
+
+
+# ---------- Batched case creation (documents already extracted client-side
+# via ExtractPreviewResponse, before Save) ----------
+# One request creates the case, every course (with its dates/CRICOS already
+# known), and every document's metadata (no file bytes here -- those upload
+# separately afterward, straight to S3, using the s3_key each created
+# DocumentResponse comes back with). See create_case_full() in
+# cases_router.py.
+
+class DocumentManifestEntry(BaseModel):
+    doc_type: DocType
+    file_name: str = Field(min_length=1, max_length=500)
+    mime_type: str
+
+
+class CourseCreateFull(CourseCreate):
+    cricos_code: str | None = None
+    documents: list[DocumentManifestEntry] = []
+
+
+class CaseCreateFull(BaseModel):
+    student_name: str = Field(min_length=1, max_length=255)
+    stream: Stream
+    courses: list[CourseCreateFull] = []
+    case_documents: list[DocumentManifestEntry] = []
+    visa_subclass: str | None = None
+    visa_length_of_stay_date: date | None = None
+    pte_valid_until_date: date | None = None
+    ovhc_relevant_date: date | None = None
+    afp_issue_date: date | None = None
+    new_coe_start_date: date | None = None
 
 
 class CaseSummaryResponse(BaseModel):

@@ -79,6 +79,20 @@ def _invalidate(table: str) -> None:
     _table_cache.pop(table, None)
 
 
+def invalidate(table: str) -> None:
+    """Public entry point for a caller that wrote to `table` from a
+    different thread than the one that will read it back next (e.g. a
+    per-course worker thread in a ThreadPoolExecutor) -- contextvars.ContextVar
+    isn't shared across threads, so that worker's own update() call already
+    invalidated the process-wide TABLE_CACHE_TTL_SECONDS cache, but couldn't
+    reach the *calling* thread's short-lived per-request cache. Call this
+    from the original (calling) thread, after the worker(s) finish, to make
+    sure the next read on this thread is genuinely fresh instead of serving
+    whatever this thread cached before the write happened.
+    """
+    _invalidate(table)
+
+
 def rows(table: str) -> list[dict]:
     cache = _request_cache.get()
     if cache is not None and table in cache:
@@ -222,6 +236,29 @@ def create_case(row: dict, courses: list[dict]) -> tuple[dict, list[dict]]:
     _invalidate("Cases")
     _invalidate("Courses")
     return data["caseRow"], data["courses"]
+
+
+def create_case_full(case_row: dict, courses: list[dict], case_documents: list[dict], uploaded_at: str) -> dict:
+    """Creates an entire case -- the Case row, every Course row (dates/CRICOS
+    already known), and every Document row's metadata for both qualification
+    and case-level documents (s3_key computed server-side in Code.gs, since
+    the real case id doesn't exist until this call assigns it) -- in a single
+    Apps Script round trip (server-side action `createCaseFull`). Replaces
+    create_case() + one insert_document_record() + up to one field-update per
+    document that the old upload-per-document flow needed, collapsing what
+    used to be dozens of serialized locked writes (Apps Script's write lock
+    is global to the whole script) down to exactly one, regardless of how
+    many qualifications/documents the case has. Callers still upload each
+    document's actual bytes to S3 afterward, using the s3_key this returns --
+    that part is unlocked and was never the bottleneck. Raises
+    StoreError("DUPLICATE_CASE") if the owner already has a case, same as
+    create_case().
+    """
+    data = _call({"action": "createCaseFull", "caseRow": case_row, "courses": courses, "caseDocuments": case_documents, "uploadedAt": uploaded_at})
+    _invalidate("Cases")
+    _invalidate("Courses")
+    _invalidate("Documents")
+    return data
 
 
 def replace_case(case_id: int, case_row: dict, courses: list[dict]) -> tuple[dict, list[dict]]:
